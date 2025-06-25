@@ -460,11 +460,8 @@ additional_security() {
     install_package "acct"
     sudo /usr/sbin/accton on || handle_error "Failed to enable process accounting"
     
-    # Restrict SSH
-    sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config || handle_error "Failed to disable root login via SSH"
-    sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config || handle_error "Failed to disable password authentication for SSH"
-    sudo sed -i 's/^#Protocol.*/Protocol 2/' /etc/ssh/sshd_config || handle_error "Failed to set SSH protocol version"
-    sudo systemctl restart sshd || handle_error "Failed to restart SSH service"
+    # Restrict SSH - with safety checks
+    secure_ssh_configuration
     
     # Configure strong password policy
     sudo sed -i 's/PASS_MAX_DAYS\t99999/PASS_MAX_DAYS\t90/' /etc/login.defs || handle_error "Failed to set password max days"
@@ -472,6 +469,178 @@ additional_security() {
     sudo sed -i 's/password.*pam_unix.so.*/password    [success=1 default=ignore]    pam_unix.so obscure sha512 minlen=14 remember=5/' /etc/pam.d/common-password || handle_error "Failed to configure password policy"
     
     log "Additional security measures applied"
+}
+
+# Function to verify SSH access safety before disabling password authentication
+verify_ssh_access_safety() {
+    log "Verifying SSH access safety before disabling password authentication..."
+    
+    # Get current user
+    local current_user=${SUDO_USER:-$USER}
+    if [ "$current_user" = "root" ]; then
+        current_user=$(who am i | awk '{print $1}' | head -1)
+    fi
+    
+    log "Checking SSH key access for user: $current_user"
+    
+    # Check if user has SSH keys
+    local user_home=$(getent passwd "$current_user" | cut -d: -f6)
+    local ssh_dir="$user_home/.ssh"
+    local authorized_keys="$ssh_dir/authorized_keys"
+    
+    if [ ! -f "$authorized_keys" ] || [ ! -s "$authorized_keys" ]; then
+        log "Warning: No SSH keys found in $authorized_keys"
+        echo ""
+        echo "⚠️  WARNING: SSH KEY ACCESS VERIFICATION REQUIRED ⚠️"
+        echo "=============================================="
+        echo "This script will disable SSH password authentication."
+        echo "If you don't have proper SSH key access, you will be LOCKED OUT!"
+        echo ""
+        echo "No authorized SSH keys found for user '$current_user'"
+        echo ""
+        local skip_ssh_hardening
+        read -p "Do you want to skip SSH password authentication disabling? (Y/n): " skip_ssh_hardening
+        case $skip_ssh_hardening in
+            [Nn]* )
+                echo "Proceeding at your own risk..."
+                return 0
+                ;;
+            * )
+                log "Skipping SSH password authentication disabling for safety"
+                return 1
+                ;;
+        esac
+    fi
+    
+    # Keys exist, let's verify access
+    echo ""
+    echo "🔑 SSH Key Access Verification"
+    echo "============================="
+    echo "SSH keys found for user '$current_user'."
+    echo ""
+    echo "Your current authorized SSH keys (showing fingerprints for security):"
+    echo ""
+    
+    # Show key fingerprints instead of full public keys for security
+    local key_count=0
+    while IFS= read -r line; do
+        if [[ $line =~ ^(ssh-|ecdsa-|ed25519) ]]; then
+            key_count=$((key_count + 1))
+            # Extract key type and create fingerprint
+            local key_type=$(echo "$line" | awk '{print $1}')
+            local key_data=$(echo "$line" | awk '{print $2}')
+            local key_comment=$(echo "$line" | awk '{print $3}')
+            
+            # Create temporary file for fingerprint generation
+            local temp_key="/tmp/temp_ssh_key_$$_$key_count"
+            echo "$line" > "$temp_key"
+            
+            # Generate fingerprint (try different formats for compatibility)
+            local fingerprint=""
+            if command -v ssh-keygen >/dev/null 2>&1; then
+                # Try modern format first (SHA256)
+                fingerprint=$(ssh-keygen -lf "$temp_key" 2>/dev/null | awk '{print $2}' | head -1)
+                if [ -z "$fingerprint" ]; then
+                    # Fallback to MD5 format
+                    fingerprint=$(ssh-keygen -E md5 -lf "$temp_key" 2>/dev/null | awk '{print $2}' | head -1)
+                fi
+            fi
+            
+            rm -f "$temp_key"
+            
+            echo "  Key $key_count: $key_type"
+            echo "    Fingerprint: ${fingerprint:-"Unable to generate"}"
+            echo "    Comment: ${key_comment:-"No comment"}"
+            echo ""
+        fi
+    done < "$authorized_keys"
+    
+    if [ $key_count -eq 0 ]; then
+        echo "No valid SSH keys found in authorized_keys file."
+        local skip_ssh_hardening
+        read -p "Skip SSH password authentication disabling? (Y/n): " skip_ssh_hardening
+        case $skip_ssh_hardening in
+            [Nn]* )
+                echo "Proceeding at your own risk..."
+                return 0
+                ;;
+            * )
+                log "Skipping SSH password authentication disabling for safety"
+                return 1
+                ;;
+        esac
+    fi
+    
+    echo "IMPORTANT SECURITY QUESTIONS:"
+    echo "1. Do you have access to the private keys corresponding to these fingerprints?"
+    echo "2. Are you currently connected via SSH with key-based authentication?"
+    echo "3. Do you have alternative access to this system (console, VNC, etc.)?"
+    echo ""
+    
+    local confirm_key_access
+    read -p "Do you confirm you have reliable SSH key access to this system? (y/N): " confirm_key_access
+    case $confirm_key_access in
+        [Yy]* )
+            log "User confirmed SSH key access. Proceeding with SSH hardening."
+            return 0
+            ;;
+        * )
+            log "User could not confirm SSH key access. Skipping SSH password disabling."
+            echo ""
+            echo "SSH hardening will be skipped. You can:"
+            echo "1. Set up SSH keys properly"
+            echo "2. Run this script again later"
+            echo "3. Manually configure SSH after ensuring key access"
+            return 1
+            ;;
+    esac
+}
+
+# Function to safely configure SSH with proper verification
+secure_ssh_configuration() {
+    log "Configuring SSH security settings..."
+    
+    # Always disable root login - this is generally safe
+    sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config || handle_error "Failed to disable root login via SSH"
+    sudo sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config || handle_error "Failed to disable root login via SSH"
+    
+    # Set SSH protocol version (though SSH2 is default in modern systems)
+    sudo sed -i 's/^#Protocol.*/Protocol 2/' /etc/ssh/sshd_config || handle_error "Failed to set SSH protocol version"
+    
+    # Verify SSH key access before disabling password authentication
+    if verify_ssh_access_safety; then
+        log "Disabling SSH password authentication..."
+        sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config || handle_error "Failed to disable password authentication for SSH"
+        sudo sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config || handle_error "Failed to disable password authentication for SSH"
+        log "SSH password authentication disabled successfully"
+    else
+        log "SSH password authentication left enabled for safety"
+        echo ""
+        echo "⚠️  SSH Password authentication remains ENABLED"
+        echo "   Consider setting up SSH keys and running the script again"
+        echo "   or manually disable password auth after verifying key access"
+    fi
+    
+    # Additional SSH hardening (these are generally safe)
+    {
+        echo ""
+        echo "# Additional SSH security settings added by security hardening script"
+        echo "MaxAuthTries 3"
+        echo "ClientAliveInterval 300"
+        echo "ClientAliveCountMax 2"
+        echo "LoginGraceTime 60"
+        echo "MaxStartups 10:30:60"
+        echo "AllowUsers $current_user"
+    } | sudo tee -a /etc/ssh/sshd_config || handle_error "Failed to add additional SSH security settings"
+    
+    # Test SSH configuration before restarting
+    if sudo sshd -t; then
+        log "SSH configuration test passed. Restarting SSH service..."
+        sudo systemctl restart sshd || handle_error "Failed to restart SSH service"
+        log "SSH service restarted successfully"
+    else
+        handle_error "SSH configuration test failed. Please check /etc/ssh/sshd_config"
+    fi
 }
 
 # Function to setup automatic updates
