@@ -147,6 +147,44 @@ create_user() {
     return 0
 }
 
+configure_passwordless_sudo() {
+    local username="$1"
+    
+    print_status "Configuring passwordless sudo for user '$username'..."
+    
+    # Backup original sudoers file
+    cp /etc/sudoers /etc/sudoers.backup.$(date +%Y%m%d_%H%M%S) || {
+        print_error "Failed to backup sudoers file"
+        return 1
+    }
+    
+    # Create sudoers drop-in file for the user
+    local sudoers_file="/etc/sudoers.d/${username}-nopasswd"
+    
+    # Add passwordless sudo rule for the user
+    echo "# Allow $username to run sudo commands without password" > "$sudoers_file"
+    echo "$username ALL=(ALL) NOPASSWD:ALL" >> "$sudoers_file"
+    
+    # Set proper permissions (sudoers files must be 440)
+    chmod 440 "$sudoers_file" || {
+        print_error "Failed to set permissions on sudoers file"
+        return 1
+    }
+    
+    # Validate sudoers configuration
+    if visudo -c; then
+        print_status "Passwordless sudo configured successfully for user '$username'"
+        print_status "User can now run 'sudo' commands without entering a password"
+        return 0
+    else
+        print_error "Sudoers configuration validation failed"
+        # Remove the problematic file
+        rm -f "$sudoers_file"
+        print_error "Removed invalid sudoers configuration"
+        return 1
+    fi
+}
+
 setup_ssh_key() {
     local username="$1"
     local user_home="/home/$username"
@@ -303,16 +341,25 @@ display_final_instructions() {
     echo ""
     print_status "VPS preparation completed successfully!"
     echo ""
+    echo "Configuration applied:"
+    echo "- Created user '$username' with sudo privileges"
+    echo "- Configured passwordless sudo access"
+    echo "- Set up SSH key authentication"
+    echo "- Applied basic SSH security settings"
+    echo ""
     echo "Next steps:"
     echo "1. ${YELLOW}IMPORTANT:${NC} Test SSH key access in a new terminal:"
     echo "   ${BLUE}ssh $username@$(hostname -I | awk '{print $1}')${NC}"
     echo ""
-    echo "2. Once confirmed working, logout from root and login as '$username'"
+    echo "2. Test passwordless sudo access:"
+    echo "   ${BLUE}sudo whoami${NC} (should not prompt for password)"
     echo ""
-    echo "3. Run the main hardening script as the new user:"
+    echo "3. Once confirmed working, logout from root and login as '$username'"
+    echo ""
+    echo "4. Run the main hardening script as the new user:"
     echo "   ${BLUE}sudo ./improved_harden_linux.sh${NC}"
     echo ""
-    echo "4. The hardening script will:"
+    echo "5. The hardening script will:"
     echo "   - Verify your SSH key access before disabling password auth"
     echo "   - Apply comprehensive security hardening"
     echo "   - Keep you safe from lockouts"
@@ -359,6 +406,14 @@ main() {
     # Create user
     if ! create_user "$username"; then
         print_error "Failed to create user. Exiting."
+        exit 1
+    fi
+    
+    echo ""
+    
+    # Configure passwordless sudo
+    if ! configure_passwordless_sudo "$username"; then
+        print_error "Failed to configure passwordless sudo. Exiting."
         exit 1
     fi
     
